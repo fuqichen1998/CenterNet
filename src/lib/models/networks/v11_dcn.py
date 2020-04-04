@@ -27,7 +27,6 @@ def conv3x3(in_planes, out_planes, stride=1):
                      padding=1, bias=False)
 
 
-
 def fill_up_weights(up):
     w = up.weight.data
     f = math.ceil(w.size(2) / 2)
@@ -49,18 +48,13 @@ def fill_fc_weights(layers):
 
 
 class BasicBlock(nn.Module):
-    def __init__(self, in_planes, planes, normalize={'type': 'solo_bn'}, stride=1):
+    def __init__(self, in_planes, planes, stride=1):
         super(BasicBlock, self).__init__()
 
         self.conv1 = conv3x3(in_planes, planes, stride)
-        self.norm1_name, norm1 = build_norm_layer(planes, normalize, 1)
-        self.add_module(self.norm1_name, norm1)
+        self.norm1 = nn.BatchNorm2d(planes, momentum=BN_MOMENTUM)
         self.relu = nn.ReLU(inplace=True)
         self.stride = stride
-
-    @property
-    def norm1(self):
-        return getattr(self, self.norm1_name)
 
     def forward(self, x):
         out = self.conv1(x)
@@ -70,18 +64,19 @@ class BasicBlock(nn.Module):
 
 
 class ConcatBlock(nn.Module):
-    expansion = [16, 8, 4, 4]
-    def __init__(self, in_planes, mul, normalize={'type': 'solo_bn'}, stride=1):
+    expansion = [32, 16, 8, 8]
+
+    def __init__(self, in_planes, mul, stride=1):
         super(ConcatBlock, self).__init__()
         self.expansion = [tmp * mul for tmp in self.expansion]
         self.block1 = BasicBlock(
-            in_planes, self.expansion[0], normalize, stride=stride)
+            in_planes, self.expansion[0], stride=stride)
         self.block2 = BasicBlock(
-            self.expansion[0], self.expansion[1], normalize, stride=stride)
+            self.expansion[0], self.expansion[1], stride=stride)
         self.block3 = BasicBlock(
-            self.expansion[1], self.expansion[2], normalize, stride=stride)
+            self.expansion[1], self.expansion[2], stride=stride)
         self.block4 = BasicBlock(
-            self.expansion[2], self.expansion[3], normalize, stride=stride)
+            self.expansion[2], self.expansion[3], stride=stride)
 
     def forward(self, x):
         out1 = self.block1(x)
@@ -91,29 +86,63 @@ class ConcatBlock(nn.Module):
         out = torch.cat([out1, out2, out3, out4], 1)
         return out
 
+
+class V11backbone(nn.Module):
+    def __init__(self):
+        super(V11backbone, self).__init__()
+        # feature
+        self.layer1 = BasicBlock(3, 32, stride=2)
+        self.layer2 = BasicBlock(32, 32, stride=2)
+        self.layer3 = ConcatBlock(32, 1, stride=1)
+        self.layer4 = BasicBlock(64, 64, stride=2)
+        self.layer5 = ConcatBlock(64, 2, stride=1)
+        self.layer6 = BasicBlock(128, 128, stride=2)
+        self.layer7 = ConcatBlock(128, 2, stride=1)
+        self.layer8 = BasicBlock(128, 128, stride=2)
+        self.layer9 = ConcatBlock(128, 4, stride=1)
+        self.layer10 = ConcatBlock(256, 4, stride=1)
+        self.layer11 = ConcatBlock(256, 4, stride=1)
+
+    def init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                n = m.kernel_size[0] * m.kernel_size[1] * m.out_channels
+                m.weight.data.normal_(0, math.sqrt(2. / n))
+                if m.bias is not None:
+                    m.bias.data.zero_()
+            elif isinstance(m, nn.BatchNorm2d):
+                m.weight.data.fill_(1)
+                m.bias.data.zero_()
+            elif isinstance(m, nn.Linear):
+                m.weight.data.normal_(0, 0.01)
+                m.bias.data.zero_()
+
+    def forward(self, x):
+        x = self.layer1(x)
+        x = self.layer2(x)
+        x = self.layer3(x)
+        x = self.layer4(x)
+        x = self.layer5(x)
+        x = self.layer6(x)
+        x = self.layer7(x)
+        x = self.layer8(x)
+        x = self.layer9(x)
+        x = self.layer10(x)
+        x = self.layer11(x)
+        return x
+
+
 class V11Net(nn.Module):
 
-    def __init__(self, block, layers, heads, head_conv):
-        self.inplanes = 128
+    def __init__(self, heads, head_conv):
+        self.inplanes = 256
         self.heads = heads
         self.deconv_with_bias = False
 
         super(V11Net, self).__init__()
-        self.batch_size = batch_size
-        layer_out_planes = [16, 32, 64, 128]
 
-        # feature;
-        self.layer1 = BasicBlock(3, 16, normalize, stride=2)
-        self.layer2 = BasicBlock(16, 16, normalize, stride=2)
-        self.layer3 = ConcatBlock(16, 1, normalize, stride=1)
-        self.layer4 = BasicBlock(32, 32, normalize, stride=2)
-        self.layer5 = ConcatBlock(32, 2, normalize, stride=1)
-        self.layer6 = BasicBlock(64, 64, normalize, stride=2)
-        self.layer7 = ConcatBlock(64, 2, normalize, stride=1)
-        self.layer8 = BasicBlock(64, 64, normalize, stride=2)
-        self.layer9 = ConcatBlock(64, 4, normalize, stride=1)
-        self.layer10 = ConcatBlock(128, 4, normalize, stride=1)
-        self.layer11 = ConcatBlock(128, 4, normalize, stride=1)
+        # feature
+        self.backbone = V11backbone()
 
         # used for deconv layers
         self.deconv_layers = self._make_deconv_layer(
@@ -146,7 +175,6 @@ class V11Net(nn.Module):
                     fill_fc_weights(fc)
             self.__setattr__(head, fc)
 
-    
     def _get_deconv_cfg(self, deconv_kernel, index):
         if deconv_kernel == 4:
             padding = 1
@@ -175,7 +203,7 @@ class V11Net(nn.Module):
             fc = DCN(self.inplanes, planes,
                      kernel_size=(3, 3), stride=1,
                      padding=1, dilation=1, deformable_groups=1)
-        
+
             up = nn.ConvTranspose2d(
                 in_channels=planes,
                 out_channels=planes,
@@ -196,43 +224,24 @@ class V11Net(nn.Module):
 
         return nn.Sequential(*layers)
 
+    def init_weights(self):
+        self.backbone.init_weights()
+        for name, m in self.deconv_layers.named_modules():
+            if isinstance(m, nn.BatchNorm2d):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+
     def forward(self, x):
-        x = self.layer1(x)
-        x = self.layer2(x)
-        x = self.layer3(x)
-        x = self.layer4(x)
-        x = self.layer5(x)
-        x = self.layer6(x)
-        x = self.layer7(x)
-        x = self.layer8(x)
-        x = self.layer9(x)
-        x = self.layer10(x)
-        x = self.layer11(x)
-
-
+        x = self.backbone(x)
         x = self.deconv_layers(x)
         ret = {}
         for head in self.heads:
             ret[head] = self.__getattr__(head)(x)
         return [ret]
 
-    def init_weights(self):
-        for m in self.modules():
-            if isinstance(m, nn.Conv2d):
-                n = m.kernel_size[0] * m.kernel_size[1] * m.out_channels
-                m.weight.data.normal_(0, math.sqrt(2. / n))
-                if m.bias is not None:
-                    m.bias.data.zero_()
-            elif isinstance(m, nn.BatchNorm2d):
-                m.weight.data.fill_(1)
-                m.bias.data.zero_()
-            elif isinstance(m, nn.Linear):
-                m.weight.data.normal_(0, 0.01)
-                m.bias.data.zero_()
 
-def get_pose_net(num_layers, heads, head_conv=256):
-  block_class, layers = resnet_spec[num_layers]
 
-  model = PoseResNet(block_class, layers, heads, head_conv=head_conv)
-  model.init_weights(num_layers)
-  return model
+def get_v11_net(num_layers, heads, head_conv=256):
+    model = V11Net(heads, head_conv=head_conv)
+    model.init_weights()
+    return model
